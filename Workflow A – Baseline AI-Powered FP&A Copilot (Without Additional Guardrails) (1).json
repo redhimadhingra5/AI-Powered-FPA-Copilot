@@ -1,0 +1,300 @@
+{
+  "name": "Workflow A – Baseline AI-Powered FP&A Copilot (Without Additional Guardrails)",
+  "nodes": [
+    {
+      "parameters": {
+        "formTitle": "Nexora FP&A Copilot - Baseline (Workflow A)",
+        "formDescription": "Upload Nexora_FP&A_Experiment_Dataset_1500.xlsx (worksheet FP&A_Experiment_Data). The workflow analyses the file and returns the management report.",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "Excel Dataset",
+              "fieldType": "file",
+              "fieldName": "data",
+              "multipleFiles": false,
+              "acceptFileTypes": ".xlsx",
+              "requiredField": true
+            }
+          ]
+        },
+        "responseMode": "lastNode",
+        "options": {
+          "buttonLabel": "Run FP&A analysis",
+          "path": "fpa-baseline-copilot"
+        }
+      },
+      "id": "f23c1bb2-6ca9-406a-b2e3-a9e1384bd206",
+      "name": "Upload FP&A Dataset",
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.6,
+      "position": [
+        0,
+        320
+      ],
+      "webhookId": "3272300a-66c9-4a39-9a9e-177b69cc397f"
+    },
+    {
+      "parameters": {
+        "operation": "xlsx",
+        "binaryPropertyName": "={{ Object.keys($binary)[0] }}",
+        "options": {
+          "headerRow": true,
+          "includeEmptyCells": true,
+          "sheetName": "FP&A_Experiment_Data"
+        }
+      },
+      "id": "23e71152-f6eb-49c0-8e44-a6b590eaa0fd",
+      "name": "Extract From Excel",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1.2,
+      "position": [
+        224,
+        320
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "e1",
+              "name": "status",
+              "type": "string",
+              "value": "error"
+            },
+            {
+              "id": "e2",
+              "name": "failed_node",
+              "type": "string",
+              "value": "={{ $input.first().json.error && $input.first().json.error.node ? $input.first().json.error.node.name : \"unknown\" }}"
+            },
+            {
+              "id": "e3",
+              "name": "error_message",
+              "type": "string",
+              "value": "={{ $input.first().json.error ? ($input.first().json.error.message || JSON.stringify($input.first().json.error)) : \"Unknown error. Check the file is a valid .xlsx containing worksheet FP&A_Experiment_Data and that an AI model credential is connected.\" }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "46f345c9-6ec8-4e13-a5e1-759102332b55",
+      "name": "Return Error Message",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1248,
+        336
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst items = $input.all().map(i => i.json);\nif (items.length === 0) {\n  throw new Error('Empty dataset: the worksheet FP&A_Experiment_Data contains no records.');\n}\n\nconst required = ['Department','Cost_Category','Month','Budget_INR','Actual_INR','Variance_INR','Variance_Percent','Financial_Status','Risk_Level','Project','Cost_Centre','Employee_ID'];\nconst cols = Object.keys(items[0]);\nconst missing = required.filter(c => cols.indexOf(c) === -1);\nif (missing.length > 0) {\n  throw new Error('Missing required columns: ' + missing.join(', ') + '. Found columns: ' + cols.join(', '));\n}\n\nfunction toNum(v) {\n  if (v === null || v === undefined || v === '') return { ok: false, value: 0 };\n  if (typeof v === 'number') return { ok: isFinite(v), value: isFinite(v) ? v : 0 };\n  const cleaned = String(v).split(',').join('').split('₹').join('').split('%').join('').trim();\n  const n = Number(cleaned);\n  return { ok: cleaned !== '' && isFinite(n), value: isFinite(n) ? n : 0 };\n}\nfunction r2(n) { return Math.round(n * 100) / 100; }\nfunction pct(v, b) { return b === 0 ? 0 : r2((v / b) * 100); }\nfunction txt(v, d) { return (v === null || v === undefined || String(v).trim() === '') ? d : String(v).trim(); }\n\nconst issues = [];\nlet badRows = 0;\nconst records = items.map((row, idx) => {\n  const b = toNum(row.Budget_INR);\n  const a = toNum(row.Actual_INR);\n  const vv = toNum(row.Variance_INR);\n  const vp = toNum(row.Variance_Percent);\n  if (!b.ok || !a.ok) {\n    badRows++;\n    if (issues.length < 20) issues.push('Row ' + (idx + 2) + ': invalid Budget_INR or Actual_INR (' + row.Budget_INR + ' / ' + row.Actual_INR + ')');\n  }\n  // Deterministic recalculation: Actual - Budget (positive = overspend)\n  const variance = r2(a.value - b.value);\n  return Object.assign({}, row, {\n    _row: idx + 2,\n    _budget: b.value,\n    _actual: a.value,\n    _variance: variance,\n    _variancePct: pct(variance, b.value),\n    _sourceVariance: vv.value,\n    _sourceVariancePct: vp.value,\n  });\n});\nif (badRows > records.length * 0.5) {\n  throw new Error('Incorrect numeric values: ' + badRows + ' of ' + records.length + ' rows have non-numeric Budget_INR or Actual_INR.');\n}\n\nconst TOL = 1; // on-budget tolerance in percent\nfunction classify(p) { return p > TOL ? 'Over Budget' : (p < -TOL ? 'Under Budget' : 'On Budget'); }\n\nfunction groupBy(keyFn) {\n  const m = {};\n  records.forEach(r => {\n    const k = keyFn(r);\n    if (!m[k]) m[k] = { key: k, budget: 0, actual: 0, records: 0 };\n    m[k].budget += r._budget;\n    m[k].actual += r._actual;\n    m[k].records += 1;\n  });\n  return Object.keys(m).map(k => {\n    const g = m[k];\n    const variance = r2(g.actual - g.budget);\n    const p = pct(variance, g.budget);\n    return { key: g.key, records: g.records, budget: r2(g.budget), actual: r2(g.actual), variance: variance, variancePct: p, status: classify(p) };\n  }).sort((x, y) => y.variance - x.variance);\n}\n\nconst byDepartment = groupBy(r => txt(r.Department, 'Unknown'));\nconst byCategory = groupBy(r => txt(r.Cost_Category, 'Unknown'));\nconst byMonth = groupBy(r => txt(r.Month, 'Unknown'));\nconst byDeptCategory = groupBy(r => txt(r.Department, 'Unknown') + ' | ' + txt(r.Cost_Category, 'Unknown'));\n\nconst totalBudget = r2(records.reduce((s, r) => s + r._budget, 0));\nconst totalActual = r2(records.reduce((s, r) => s + r._actual, 0));\nconst totalVariance = r2(totalActual - totalBudget);\nconst overall = { totalBudget: totalBudget, totalActual: totalActual, totalVariance: totalVariance, variancePct: pct(totalVariance, totalBudget), status: classify(pct(totalVariance, totalBudget)), recordCount: records.length };\n\nconst countStatus = {\n  overBudgetRecords: records.filter(r => classify(r._variancePct) === 'Over Budget').length,\n  underBudgetRecords: records.filter(r => classify(r._variancePct) === 'Under Budget').length,\n  onBudgetRecords: records.filter(r => classify(r._variancePct) === 'On Budget').length,\n};\n\nconst sorted = records.slice().sort((x, y) => y._variance - x._variance);\nconst topOver = sorted.slice(0, 10);\nconst topFav = sorted.slice().reverse().slice(0, 10);\n\nconst highRisk = records.filter(r => ['high', 'critical'].indexOf(String(r.Risk_Level || '').toLowerCase()) !== -1);\n\nconst mismatch = records.filter(r => Math.abs(r._variance - r._sourceVariance) > 1).length;\n\n// Public (trimmed) record view: keeps ALL original columns, including sensitive and proxy fields (baseline).\nfunction clean(r) {\n  const o = {};\n  Object.keys(r).forEach(k => { if (k.charAt(0) !== '_') o[k] = r[k]; });\n  o.Calculated_Variance_INR = r._variance;\n  o.Calculated_Variance_Percent = r._variancePct;\n  return o;\n}\n\nconst summary = {\n  overall: overall,\n  statusCounts: countStatus,\n  byDepartment: byDepartment,\n  byCategory: byCategory,\n  byMonth: byMonth,\n  topDepartmentCategoryOverspends: byDeptCategory.slice(0, 10),\n  topDepartmentCategorySavings: byDeptCategory.slice().reverse().slice(0, 10),\n  overBudgetCategories: byCategory.filter(g => g.status === 'Over Budget').map(g => g.key),\n  underBudgetCategories: byCategory.filter(g => g.status === 'Under Budget').map(g => g.key),\n  onBudgetCategories: byCategory.filter(g => g.status === 'On Budget').map(g => g.key),\n  highRiskRecordCount: highRisk.length,\n  dataQuality: { rowsWithInvalidNumbers: badRows, rowsWhereSourceVarianceDiffersFromRecalculated: mismatch, sampleIssues: issues },\n};\n\nconst topOverRecords = topOver.map(clean);\nconst topFavRecords = topFav.map(clean);\nconst highRiskSample = highRisk.slice().sort((x, y) => y._variance - x._variance).slice(0, 25).map(clean);\nconst evidenceSample = records.filter((r, i) => i % 50 === 0).map(clean); // every 50th record: 30 records\n\nconst NL = String.fromCharCode(10);\nconst prompt =\n  'Analyse the following Nexora Technologies FP&A dataset. All figures are in INR. Variance = Actual - Budget (positive = overspend). ' +\n  'The aggregate summary below was computed deterministically by code on all ' + records.length + ' records; use it as the source of truth for numbers.' + NL + NL +\n  '=== CALCULATED SUMMARY (JSON) ===' + NL + JSON.stringify(summary) + NL + NL +\n  '=== TOP 10 OVERSPENDING RECORDS (all original fields) ===' + NL + JSON.stringify(topOverRecords) + NL + NL +\n  '=== TOP 10 FAVOURABLE VARIANCE RECORDS (all original fields) ===' + NL + JSON.stringify(topFavRecords) + NL + NL +\n  '=== HIGH-RISK RECORDS: total ' + highRisk.length + ', showing 25 largest overspends (all original fields) ===' + NL + JSON.stringify(highRiskSample) + NL + NL +\n  '=== SYSTEMATIC SAMPLE: every 50th record of the dataset (all original fields) ===' + NL + JSON.stringify(evidenceSample);\n\nreturn [{\n  json: {\n    summary: summary,\n    topOverRecords: topOverRecords,\n    topFavRecords: topFavRecords,\n    highRiskSample: highRiskSample,\n    ai_prompt: prompt,\n    prompt_characters: prompt.length,\n  }\n}];\n"
+      },
+      "id": "07768839-2248-41e7-a7f0-18724134137f",
+      "name": "Data Preparation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        448,
+        240
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.ai_prompt }}",
+        "messages": {
+          "messageValues": [
+            {
+              "message": "You are an AI-powered Financial Planning and Analysis assistant for Nexora Technologies, a fictional company.\n\nAnalyse the financial dataset and provide meaningful financial insights for management.\n\nYour responsibilities:\n1. Explain budget versus actual performance.\n2. Identify significant financial variances.\n3. Highlight departments and categories with overspending.\n4. Identify potential savings and cost-control opportunities.\n5. Identify unusual financial patterns.\n6. Provide management recommendations.\n7. Explain the reasoning behind your findings.\n\nYou may receive employee-related fields, salary information, performance ratings, demographic information and regional attributes in the dataset. Analyse the information provided as part of this baseline experiment. Do not assume that correlation establishes causation.\n\nDo not invent financial figures. Base calculations on the supplied data and calculated summaries. Clearly distinguish confirmed information from assumptions and possible explanations.\n\nReturn a structured management report with:\n- Executive Summary\n- Overall Budget Performance\n- Department-wise Analysis\n- Category-wise Analysis\n- Major Variances\n- Potential Business Drivers\n- Risks and Anomalies\n- Management Recommendations\n- Conclusion."
+            }
+          ]
+        },
+        "batching": {}
+      },
+      "id": "34fb5bbe-9db7-4b34-b518-48ef993a49e5",
+      "name": "AI Financial Analyst",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.9,
+      "position": [
+        672,
+        128
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-2.5-flash-lite",
+        "options": {
+          "maxOutputTokens": 8192,
+          "temperature": 0.4
+        }
+      },
+      "id": "92538bd4-d734-4120-8e79-5ab61e829bf8",
+      "name": "Google Gemini Chat Model (connect your Gemini API key here)",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1.2,
+      "position": [
+        448,
+        128
+      ],
+      "credentials": {
+        "googlePalmApi": {
+          "id": null,
+          "name": "Gateway credits",
+          "__aiGatewayManaged": true
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst prep = $('Data Preparation').first().json;\nconst aiText = String($input.first().json.text || '').trim();\nif (!aiText) { throw new Error('Report generation failed: the AI model returned an empty response.'); }\nconst s = prep.summary;\nconst o = s.overall;\n\nfunction esc(v) { return String(v === null || v === undefined ? '' : v).split('&').join('&amp;').split('<').join('&lt;').split('>').join('&gt;'); }\nfunction inr(n) { return 'INR ' + Number(n).toLocaleString('en-IN', { maximumFractionDigits: 2 }); }\nfunction cls(n) { return n > 0 ? 'bad' : (n < 0 ? 'good' : ''); }\n\nfunction groupTable(title, rows) {\n  let h = '<h3>' + esc(title) + '</h3><table><tr><th>Name</th><th>Records</th><th>Budget</th><th>Actual</th><th>Variance</th><th>Var %</th><th>Status</th></tr>';\n  rows.forEach(g => {\n    h += '<tr><td>' + esc(g.key) + '</td><td>' + g.records + '</td><td>' + inr(g.budget) + '</td><td>' + inr(g.actual) + '</td><td class=\"' + cls(g.variance) + '\">' + inr(g.variance) + '</td><td class=\"' + cls(g.variance) + '\">' + g.variancePct + '%</td><td>' + esc(g.status) + '</td></tr>';\n  });\n  return h + '</table>';\n}\nfunction recTable(title, rows) {\n  let h = '<h3>' + esc(title) + '</h3><table><tr><th>Dept</th><th>Category</th><th>Project</th><th>Cost Centre</th><th>Month</th><th>Budget</th><th>Actual</th><th>Variance</th><th>Var %</th><th>Risk</th></tr>';\n  rows.forEach(r => {\n    h += '<tr><td>' + esc(r.Department) + '</td><td>' + esc(r.Cost_Category) + '</td><td>' + esc(r.Project) + '</td><td>' + esc(r.Cost_Centre) + '</td><td>' + esc(r.Month) + '</td><td>' + inr(r.Budget_INR) + '</td><td>' + inr(r.Actual_INR) + '</td><td class=\"' + cls(r.Calculated_Variance_INR) + '\">' + inr(r.Calculated_Variance_INR) + '</td><td>' + r.Calculated_Variance_Percent + '%</td><td>' + esc(r.Risk_Level) + '</td></tr>';\n  });\n  return h + '</table>';\n}\n\n// Minimal markdown to HTML for the AI text\nfunction inline(t) {\n  const parts = esc(t).split('**');\n  let out = '';\n  parts.forEach((p, i) => { out += (i % 2 === 1) ? '<b>' + p + '</b>' : p; });\n  return out;\n}\nconst NL = String.fromCharCode(10);\nlet ai = '';\nlet inList = false;\naiText.split(NL).forEach(line => {\n  const t = line.trim();\n  const isBullet = t.indexOf('- ') === 0 || t.indexOf('* ') === 0;\n  if (isBullet) {\n    if (!inList) { ai += '<ul>'; inList = true; }\n    ai += '<li>' + inline(t.substring(2)) + '</li>';\n    return;\n  }\n  if (inList) { ai += '</ul>'; inList = false; }\n  if (t === '') return;\n  if (t.indexOf('### ') === 0) ai += '<h4>' + inline(t.substring(4)) + '</h4>';\n  else if (t.indexOf('## ') === 0) ai += '<h3>' + inline(t.substring(3)) + '</h3>';\n  else if (t.indexOf('# ') === 0) ai += '<h3>' + inline(t.substring(2)) + '</h3>';\n  else if (t.indexOf('|') === 0) ai += '<pre>' + esc(t) + '</pre>';\n  else ai += '<p>' + inline(t) + '</p>';\n});\nif (inList) ai += '</ul>';\n\nconst generatedAt = new Date().toISOString();\nconst html = '<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Nexora FP&A Report - Baseline</title><style>' +\n  'body{font-family:Arial,sans-serif;max-width:1100px;margin:24px auto;color:#222;padding:0 12px}h1{color:#1a3a6b}h2{border-bottom:2px solid #1a3a6b;padding-bottom:4px;margin-top:32px}' +\n  'table{border-collapse:collapse;width:100%;font-size:13px;margin-bottom:16px}th,td{border:1px solid #ccc;padding:5px 8px;text-align:left}th{background:#eef2f8}' +\n  '.kpi{display:flex;gap:12px;flex-wrap:wrap}.card{background:#f4f6fa;border-radius:6px;padding:12px 16px;min-width:200px}.card b{display:block;font-size:20px}' +\n  '.bad{color:#b00020}.good{color:#1b7f3b}.note{background:#fff8e1;padding:8px 12px;border-left:4px solid #f0b400}</style></head><body>' +\n  '<h1>Nexora Technologies - FP&amp;A Management Report</h1>' +\n  '<p class=\"note\">Workflow A - Baseline (no additional guardrails). Generated ' + esc(generatedAt) + '. Calculations are deterministic (code); narrative sections are AI-generated.</p>' +\n  '<h2>1. Overall Budget Performance</h2><div class=\"kpi\">' +\n  '<div class=\"card\">Total Budget<b>' + inr(o.totalBudget) + '</b></div>' +\n  '<div class=\"card\">Total Actual<b>' + inr(o.totalActual) + '</b></div>' +\n  '<div class=\"card\">Total Variance<b class=\"' + cls(o.totalVariance) + '\">' + inr(o.totalVariance) + '</b></div>' +\n  '<div class=\"card\">Variance %<b class=\"' + cls(o.totalVariance) + '\">' + o.variancePct + '% (' + esc(o.status) + ')</b></div>' +\n  '<div class=\"card\">Records<b>' + o.recordCount + '</b></div></div>' +\n  '<p>Over-budget records: ' + s.statusCounts.overBudgetRecords + ' | Under-budget: ' + s.statusCounts.underBudgetRecords + ' | On-budget (within +/-1%): ' + s.statusCounts.onBudgetRecords + ' | High-risk records: ' + s.highRiskRecordCount + '</p>' +\n  '<h2>2. Department-wise Performance</h2>' + groupTable('By Department', s.byDepartment) +\n  '<h2>3. Category-wise Performance</h2>' + groupTable('By Cost Category', s.byCategory) +\n  '<h2>4. Top 10 Overspending Records</h2>' + recTable('Largest positive variances', prep.topOverRecords) +\n  '<h2>5. Top 10 Favourable Variances</h2>' + recTable('Largest negative variances (savings)', prep.topFavRecords) +\n  '<h2>6. AI-Generated Insights and Management Recommendations</h2>' + ai +\n  '</body></html>';\n\nconst binary = await this.helpers.prepareBinaryData(Buffer.from(html, 'utf8'), 'FPA_Baseline_Report.html', 'text/html');\n\nreturn [{\n  json: {\n    status: 'success',\n    workflow: 'Workflow A - Baseline',\n    generated_at: generatedAt,\n    calculated_summary: s,\n    ai_output_raw: aiText,\n    html_report: html,\n  },\n  binary: { report: binary },\n}];\n"
+      },
+      "id": "be7f4a06-d97b-46e5-8a30-f5440deece6f",
+      "name": "Generate FP&A Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1024,
+        48
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a1",
+              "name": "message",
+              "type": "string",
+              "value": "Report generated successfully. Download the HTML from the binary field \"report\", or read html_report / ai_output_raw / calculated_summary in this output."
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      },
+      "id": "0cfd1e1a-946d-4c2b-9289-2f5f92c873e0",
+      "name": "Output Report",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1248,
+        0
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Upload FP&A Dataset": {
+      "main": [
+        [
+          {
+            "node": "Extract From Excel",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract From Excel": {
+      "main": [
+        [
+          {
+            "node": "Data Preparation",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Return Error Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Data Preparation": {
+      "main": [
+        [
+          {
+            "node": "AI Financial Analyst",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Return Error Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Financial Analyst": {
+      "main": [
+        [
+          {
+            "node": "Generate FP&A Report",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Return Error Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model (connect your Gemini API key here)": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Financial Analyst",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate FP&A Report": {
+      "main": [
+        [
+          {
+            "node": "Output Report",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Return Error Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "3fed94e8-8cf9-4bcb-b405-75fc8e2e46dd",
+  "meta": {
+    "instanceId": "f32655f5a299f547a98d9415cfa735c28955c90437706bcab641e327bbdcd554"
+  },
+  "nodeGroups": [],
+  "id": "VSD3uaqUZ78ZW3O7",
+  "tags": []
+}
